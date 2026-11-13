@@ -12,7 +12,15 @@
 - Пользователь — **игрок**, сервер свой. Модули ставит GM (по manifest URL), поэтому по умолчанию
   предпочитаем **standalone Script-макрос**, который пользователь вставляет в Foundry сам.
   Модуль — только когда нужны хуки или общий код для многих макросов.
-- **Локально Foundry нет** — запустить и протестировать код нельзя. Тестирует пользователь в игре.
+- **Локально Foundry нет.** Сервер: `https://foundry.zeldrak.ru/game` (пользователь залогинен в Chrome
+  «Browser 2 (Windows)»). Через Claude in Chrome можно читать данные мира/персонажа и проверять API в
+  `javascript_tool` — но **ничего не бросать в чат и не менять лист без согласия пользователя** (это живая игра).
+  Полный прогон макроса делает пользователь.
+- Персонаж: **Базгиру**, Exemplar. Ikon'ы: Gleaming Blade (фальшион), Scar of the Survivor, Gaze Sharp as Steel.
+  Energized Spark (огонь).
+- Важные модули мира: **PF2e Utility Buttons** (`pf2e-flatcheck-helper`, flat check'и в сообщениях атак,
+  у пользователя включён автобросок), **PF2E Visioner** (видимость по наблюдателю), PF2e Toolbelt,
+  xdy Workbench, PF2e HUD, Token Action HUD, Dice So Nice нет.
 - Репозиторий: `git@github.com:artpotsipko/pf_module.git`, ветка `main` (SSH-ключ настроен, `gh` нет).
 
 ## Структура
@@ -72,10 +80,18 @@ git sparse-checkout add packs/pf2e/<нужная папка>   # данные п
 - Перехват системного сообщения: `Hooks.on("preCreateChatMessage", ...)` с `return false` отменяет
   создание, а `message.toObject()` даёт готовые данные с флагами pf2e — их можно доработать и создать одно своё сообщение.
 - Окна: `foundry.applications.api.DialogV2.wait({ window, content, buttons, rejectClose: false })`,
-  в `callback(event, button)` поля формы — `button.form.elements`.
+  в `callback(event, button)` поля формы — `button.form.elements`; кнопка без callback возвращает свой `action`.
+- Flat check: система pf2e сама их **не** бросает. Их считает PF2e Utility Buttons в `_preCreate` сообщения атаки
+  (с учётом Visioner) и пишет в `message.flags["pf2e-flatcheck-helper"].flatchecks` →
+  `{ target: { type: "hidden", baseDc, finalDc, roll?, reroll?: { oldRoll, keep }, secret? } }`.
+  `finalDc <= 1` — автоуспех, `null`/`>= 20` — неизвестно/невозможно, `secret` (undetected) — результат знает только GM.
+  Если `roll` нет, можно бросить d20 и записать `flags.pf2e-flatcheck-helper.flatchecks.<key>.roll` в сообщение (как кнопка модуля).
+- Exemplar: искра — mergeable-тоггл `divine-spark`, suboption = slug ikon'а (список ikon'ов берётся из `suboptions`).
+  По правилам Transcendence искра сразу после действия выбивается в **другой** ikon на выбор.
 
 ## Готовые макросы
 
 - `macros/flowing-spirit-strike.js` — Exemplar, Gleaming Blade: два удара через тоггл действия,
   при двух попаданиях урон spirit / Energized Spark объединяется в одно сообщение (IWR и precision — один раз);
-  при одном попадании — обычный урон с типом оружия.
+  при одном попадании — обычный урон с типом оружия. Учитывает flat check'и PF2e Utility Buttons
+  (провал = промах), в конце предлагает перенести искру в другой ikon.

@@ -3,19 +3,25 @@
  * Foundry VTT v14, система PF2e 8.7.x. Тип макроса: Script.
  *
  * Что делает:
- *  1. Окно: оружие-ikon (если их несколько), тип урона (Energized Spark), MAP, «искра покидает ikon».
+ *  1. Окно: оружие-ikon (если их несколько), тип урона (Energized Spark), MAP.
  *  2. Включает на листе тоггл Flowing Spirit Strike (First Strike) и бросает 1-й удар.
  *  3. Переключает тоггл на Second Strike (система сама даёт −2, если у клинка нет agile) и бросает 2-й удар.
  *     Оба удара с выбранным MAP — как в тексте действия.
- *  4. Урон:
+ *  4. Flat check (цель concealed / hidden и т.п.): берётся из модуля PF2e Utility Buttons
+ *     (pf2e-flatcheck-helper), который сам считает КС с учётом PF2e Visioner и пишет его в сообщение атаки.
+ *     Если модуль не бросил проверку автоматически, макрос бросает её сам и записывает в то же сообщение.
+ *     Проваленный flat check = промах этим ударом. Секретные проверки (цель undetected) знает только GM —
+ *     в этом случае урон не бросается.
+ *  5. Урон:
  *     - оба попали → весь урон spirit (или тип Energized Spark), один бросок одним сообщением:
  *       экземпляры урона одного типа сложены,
  *       поэтому сопротивления/слабости применяются один раз; precision учитывается только один раз;
  *     - попал один → обычный урон этого удара с родным типом оружия (spirit / Energized Spark
  *       не применяются; бонус immanence Gleaming Blade остаётся, как при любом ударе ikon'ом);
  *     - оба промахнулись → урона нет.
- *  5. Возвращает тогглы как было. Если отмечено «искра покидает ikon», выключает Divine Spark
- *     (так работает Spark Transcendence, после него нужен Shift Immanence).
+ *  6. Возвращает тогглы как было и предлагает, в какой из остальных ikon'ов переходит искра
+ *     (Spark Transcendence: искра выбивается из Gleaming Blade в другой ikon на выбор).
+ *     Если окно выбора закрыть крестиком — искра не трогается.
  *
  * Spirit-урон, −2 на второй удар и смену типа урона от Energized Spark считает сама система
  * через правила действия и фита. Макрос только переключает тогглы и бросает удары.
@@ -26,8 +32,11 @@
 const FSS_OPTION = "flowing-spirit-strike";
 const SPARK_OPTION = "divine-spark";
 const ENERGY_OPTION = "energized-spark-damage";
-const IKON_TAG = "item:tag:physical-ikon:gleaming-blade";
+const IKON_SLUG = "gleaming-blade";
+const IKON_TAG = `item:tag:physical-ikon:${IKON_SLUG}`;
+const FLAT_MODULE = "pf2e-flatcheck-helper";
 const HIT_OUTCOMES = ["success", "criticalSuccess"];
+const FLAT_TYPE_LABELS = { concealed: "скрыт", hidden: "спрятан", undetected: "не обнаружен", unnoticed: "не замечен" };
 
 const fssWarn = (msg) => ui.notifications.warn(`Flowing Spirit Strike: ${msg}`);
 const fssEsc = (s) =>
@@ -45,23 +54,85 @@ async function setToggle(pc, option, value, suboption = null) {
     await pc.toggleRollOption("all", option, toggle.itemId, value, suboption ?? selectedSub(toggle));
 }
 
+/* ---------- Flat check (PF2e Utility Buttons) ---------- */
+
+/**
+ * Читает flat check'и, которые PF2e Utility Buttons записал в сообщение атаки. Недостающие броски
+ * делает сам и сохраняет в сообщение (как кнопка модуля), чтобы результат был виден на карточке.
+ * status: "none" — проверок нет, "pass", "fail", "unknown" — результат знает только GM / КС неизвестен.
+ */
+async function resolveFlatChecks(messageId) {
+    const result = { status: "none", checks: [] };
+    const message = messageId ? game.messages.get(messageId) : null;
+    const checks = message?.flags?.[FLAT_MODULE]?.flatchecks;
+    if (!checks) return result;
+
+    const updates = {};
+    for (const [key, check] of Object.entries(checks)) {
+        if (!check || !("finalDc" in check)) continue; // служебные записи (счётчик целей)
+        const dc = check.finalDc;
+        if (dc != null && dc <= 1) continue; // автоуспех
+        if (dc == null || check.secret) {
+            result.checks.push({ type: check.type, dc, roll: null, passed: null });
+            continue;
+        }
+
+        let roll = check.roll ?? null;
+        if (roll == null && dc < 20) {
+            const d20 = await new Roll("1d20").evaluate();
+            game.dice3d?.showForRoll(d20, game.user, true, null, false, message.id);
+            roll = d20.total;
+            updates[`flags.${FLAT_MODULE}.flatchecks.${key}.roll`] = roll;
+        } else if (roll != null && check.reroll?.keep === "low") {
+            roll = Math.min(check.reroll.oldRoll, roll);
+        } else if (roll != null && check.reroll?.keep === "high") {
+            roll = Math.max(check.reroll.oldRoll, roll);
+        }
+        result.checks.push({ type: check.type, dc, roll, passed: dc < 20 && roll >= dc });
+    }
+    if (Object.keys(updates).length > 0) await message.update(updates);
+
+    if (result.checks.some((c) => c.passed === false)) result.status = "fail";
+    else if (result.checks.some((c) => c.passed === null)) result.status = "unknown";
+    else if (result.checks.length > 0) result.status = "pass";
+    return result;
+}
+
+const flatText = (flat) =>
+    (flat?.checks ?? [])
+        .filter((c) => c.roll != null)
+        .map((c) => `flat check ${c.roll} / КС ${c.dc}${c.passed ? "" : " — провал"}`)
+        .join(", ");
+
 /* ---------- Удары ---------- */
 
 const isIkonStrike = (a) => a.type === "strike" && (a.item?.getRollOptions?.("item") ?? []).includes(IKON_TAG);
 // После каждого переключения тоггла система пересобирает удары, поэтому ищем удар заново по id оружия
 const findStrike = (pc, itemId) => pc.system.actions.find((a) => a.type === "strike" && a.item?.id === itemId) ?? null;
 
-async function rollAttack(pc, itemId, map) {
+async function rollAttack(pc, itemId, map, n) {
     const strike = findStrike(pc, itemId);
     if (!strike) throw new Error(`Strike for item ${itemId} not found`);
     let result = null;
     const roll = await strike.variants[map].roll({
         callback: (_roll, outcome, message) => {
-            result = { outcome: outcome ?? null, context: message?.flags?.pf2e?.context ?? null };
+            result = {
+                outcome: outcome ?? null,
+                context: message?.flags?.pf2e?.context ?? null,
+                messageId: message?.id ?? null,
+            };
         },
     });
     if (!roll) return null; // окно броска закрыли
-    return result ?? { outcome: null, context: null };
+    result ??= { outcome: null, context: null, messageId: null };
+
+    result.flat = await resolveFlatChecks(result.messageId);
+    if (result.flat.status === "fail" && HIT_OUTCOMES.includes(result.outcome)) {
+        const failed = result.flat.checks.find((c) => c.passed === false);
+        const why = FLAT_TYPE_LABELS[failed?.type] ?? failed?.type ?? "";
+        ui.notifications.info(`Удар ${n}: провал flat check (${failed?.roll ?? "—"} < КС ${failed?.dc}${why ? `, цель ${why}` : ""}) — промах.`);
+    }
+    return result;
 }
 
 /**
@@ -83,7 +154,7 @@ async function rollDamage(pc, itemId, attack, map, { capture = false } = {}) {
     });
     try {
         const roll = await strike[method](params);
-        return roll && captured ? { roll, outcome: attack.outcome, ...captured } : null;
+        return roll && captured ? { roll, outcome: attack.outcome, flat: attack.flat, ...captured } : null;
     } finally {
         Hooks.off("preCreateChatMessage", hookId);
     }
@@ -180,7 +251,8 @@ function buildFlavor(A, B, base, precisionStripped) {
     const breakdowns = document.createElement("div");
     for (const [n, part] of [[1, A], [2, B]]) {
         const line = document.createElement("div");
-        line.innerHTML = `<strong>Удар ${n}:</strong> ${fssEsc(outcomeLabel(part.outcome))}`;
+        const flat = flatText(part.flat);
+        line.innerHTML = `<strong>Удар ${n}:</strong> ${fssEsc(outcomeLabel(part.outcome))}${flat ? ` (${fssEsc(flat)})` : ""}`;
         breakdowns.append(line);
         const tags = parse(part.data.flavor).querySelector(".tags.modifiers");
         if (tags) breakdowns.append(tags);
@@ -224,13 +296,21 @@ async function postCombined(A, B) {
 }
 
 async function resolveDamage(pc, choice, first, second) {
-    if (first.outcome === null || second.outcome === null) {
+    const attacks = [first, second];
+    if (attacks.some((a) => a.outcome === null)) {
         fssWarn("не удалось определить попадание (нет КД цели?). Брось урон с карточек атак вручную.");
         return;
     }
-    const hits = [first, second].filter((a) => HIT_OUTCOMES.includes(a.outcome));
+
+    const rolledHits = attacks.filter((a) => HIT_OUTCOMES.includes(a.outcome));
+    if (rolledHits.some((a) => a.flat?.status === "unknown")) {
+        fssWarn("результат flat check знает только GM (цель undetected). Урон не брошен — брось его с карточки атаки после решения GM.");
+        return;
+    }
+
+    const hits = rolledHits.filter((a) => a.flat?.status !== "fail");
     if (hits.length === 0) {
-        ui.notifications.info("Flowing Spirit Strike: оба удара промахнулись.");
+        ui.notifications.info("Flowing Spirit Strike: оба удара не попали.");
         return;
     }
     if (hits.length === 1) {
@@ -249,6 +329,31 @@ async function resolveDamage(pc, choice, first, second) {
         // Один из бросков урона отменили в окне — выкладываем то, что есть
         for (const part of [A, B]) if (part) await postCaptured(part);
     }
+}
+
+/* ---------- Переход искры после Spark Transcendence ---------- */
+
+async function moveSpark(pc) {
+    const spark = getToggle(pc, SPARK_OPTION);
+    if (!spark) return;
+    const others = spark.suboptions.filter((s) => s.value !== IKON_SLUG);
+    if (others.length === 0) {
+        await setToggle(pc, SPARK_OPTION, false);
+        return;
+    }
+
+    const target = await foundry.applications.api.DialogV2.wait({
+        window: { title: "Spark Transcendence" },
+        content: "<p>Искра выбита из Gleaming Blade. В какой ikon она переходит?</p>",
+        buttons: others.map((s, i) => ({
+            action: s.value,
+            label: game.i18n.localize(s.label),
+            default: i === 0,
+        })),
+        rejectClose: false,
+    });
+    if (!target) return; // окно закрыли — искру не трогаем
+    await setToggle(pc, SPARK_OPTION, true, target);
 }
 
 /* ---------- Окно настроек ---------- */
@@ -281,10 +386,6 @@ async function askOptions(strikes, energy) {
     const content = `
         ${strikeField}
         ${energyField}
-        <div class="form-group">
-            <label>Искра покидает ikon (Spark Transcendence)</label>
-            <input type="checkbox" name="castOut" checked>
-        </div>
         <p>Какая это атака в ходу? Оба удара бросаются с этим штрафом MAP.</p>`;
 
     const names = ["1-я атака", "2-я атака", "3-я атака"];
@@ -298,7 +399,6 @@ async function askOptions(strikes, energy) {
                 map,
                 itemId: f.itemId?.value ?? ref.item.id,
                 energy: f.energy?.value ?? null,
-                castOut: !!f.castOut?.checked,
             };
         },
     }));
@@ -324,6 +424,9 @@ async function flowingSpiritStrike() {
     const strikes = pc.system.actions.filter(isIkonStrike);
     if (strikes.length === 0) return fssWarn("не найден удар оружием-ikon Gleaming Blade.");
     if (game.user.targets.size !== 1) return fssWarn("возьми в цель ровно одного противника.");
+    if (!game.modules.get(FLAT_MODULE)?.active) {
+        fssWarn("модуль PF2e Utility Buttons выключен — flat check против скрытых целей не учитывается.");
+    }
 
     const energy = getToggle(pc, ENERGY_OPTION);
     const choice = await askOptions(strikes, energy);
@@ -346,12 +449,12 @@ async function flowingSpiritStrike() {
         }
 
         await setToggle(pc, FSS_OPTION, true, "first-strike");
-        const first = await rollAttack(pc, choice.itemId, choice.map);
+        const first = await rollAttack(pc, choice.itemId, choice.map, 1);
         if (!first) return;
         performed = true;
 
         await setToggle(pc, FSS_OPTION, true, "second-strike");
-        const second = await rollAttack(pc, choice.itemId, choice.map);
+        const second = await rollAttack(pc, choice.itemId, choice.map, 2);
         if (!second) return fssWarn("второй удар отменён, урон не брошен.");
 
         await resolveDamage(pc, choice, first, second);
@@ -359,9 +462,14 @@ async function flowingSpiritStrike() {
         console.error("Flowing Spirit Strike |", err);
         ui.notifications.error("Flowing Spirit Strike: ошибка, подробности в консоли (F12).");
     } finally {
-        await setToggle(pc, FSS_OPTION, false, "first-strike");
-        if (energyChanged) await setToggle(pc, ENERGY_OPTION, energyBefore.on, energyBefore.sub);
-        if (performed && choice.castOut) await setToggle(pc, SPARK_OPTION, false);
+        try {
+            await setToggle(pc, FSS_OPTION, false, "first-strike");
+            if (energyChanged) await setToggle(pc, ENERGY_OPTION, energyBefore.on, energyBefore.sub);
+            if (performed) await moveSpark(pc);
+        } catch (err) {
+            console.error("Flowing Spirit Strike | ошибка при возврате тогглов", err);
+            ui.notifications.error("Flowing Spirit Strike: не удалось вернуть тогглы/искру, проверь лист персонажа.");
+        }
     }
 }
 
