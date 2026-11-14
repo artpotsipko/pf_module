@@ -86,6 +86,10 @@ git sparse-checkout add packs/pf2e/<нужная папка>   # данные п
   `{ target: { type: "hidden", baseDc, finalDc, roll?, reroll?: { oldRoll, keep }, secret? } }`.
   `finalDc <= 1` — автоуспех, `null`/`>= 20` — неизвестно/невозможно, `secret` (undetected) — результат знает только GM.
   Если `roll` нет, можно бросить d20 и записать `flags.pf2e-flatcheck-helper.flatchecks.<key>.roll` в сообщение (как кнопка модуля).
+- Силовое (forceful) и twin: система добавляет модификаторы `forceful-second`/`forceful-third` с `ignored: true`
+  и сама их **никогда** не включает (только галочка в окне урона). Включить из макроса: эффект с `FlatModifier`
+  (`selector: "strike-damage"`, `type: "circumstance"`, `value` = `weapon.system.damage.dice` × уровень) и
+  predicate на свою опцию, а опцию передать в `strike.damage({ options: [...] })` — `params.options` доходят до предикатов.
 - Exemplar: искра — mergeable-тоггл `divine-spark`, suboption = slug ikon'а (список ikon'ов берётся из `suboptions`).
   По правилам Transcendence искра сразу после действия выбивается в **другой** ikon на выбор.
 
@@ -94,7 +98,8 @@ git sparse-checkout add packs/pf2e/<нужная папка>   # данные п
 - `macros/flowing-spirit-strike.js` — Exemplar, Gleaming Blade: два удара через тоггл действия,
   при двух попаданиях урон spirit / Energized Spark объединяется в одно сообщение (IWR и precision — один раз);
   при одном попадании — обычный урон с типом оружия. Учитывает flat check'и PF2e Utility Buttons
-  (провал = промах), в конце предлагает перенести искру в другой ikon.
+  (провал = промах), в конце предлагает перенести искру в другой ikon. Силовое (forceful) считает по номеру
+  атаки в ходу (MAP из окна + номер удара) через временный скрытый эффект, удаляемый в `finally`.
 - `macros/no-scar-but-this.js` — Scar of the Survivor: бросает (ceil(уровень/2))d8 vitality-лечения,
   сразу применяет к себе (`applyDamage` с отрицательным уроном), переносит искру.
 - `macros/a-moment-unending.js` — Gaze Sharp as Steel: карточка действия + эффект с `DamageDice` precision

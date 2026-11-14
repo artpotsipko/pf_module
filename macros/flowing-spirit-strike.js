@@ -19,6 +19,12 @@
  *     - попал один → обычный урон этого удара с родным типом оружия (spirit / Energized Spark
  *       не применяются; бонус immanence Gleaming Blade остаётся, как при любом ударе ikon'ом);
  *     - оба промахнулись → урона нет.
+ *     Силовое (forceful): система сама его не включает (только галочкой в окне урона), а MAP между
+ *     ударами действия не растёт. Поэтому макрос считает номер атаки в ходу сам: 2-й удар действия
+ *     всегда минимум 2-я атака → +кол-во кубов урона; если действие начато со 2-й/3-й атаки,
+ *     то и 1-й удар получает силовое (3-я атака и дальше → +2× кол-во кубов). Бонус обстоятельства,
+ *     поэтому с галочкой силового в окне урона не складывается. Для этого на время макроса
+ *     на персонажа вешается скрытый эффект, в конце он удаляется.
  *  6. Возвращает тогглы как было и предлагает, в какой из остальных ikon'ов переходит искра
  *     (Spark Transcendence: искра выбивается из Gleaming Blade в другой ikon на выбор).
  *     Если окно выбора закрыть крестиком — искра не трогается.
@@ -35,6 +41,8 @@ const ENERGY_OPTION = "energized-spark-damage";
 const IKON_SLUG = "gleaming-blade";
 const IKON_TAG = `item:tag:physical-ikon:${IKON_SLUG}`;
 const FLAT_MODULE = "pf2e-flatcheck-helper";
+const FORCEFUL_EFFECT_SLUG = "fss-macro-forceful";
+const FORCEFUL_OPTION = "fss-macro:forceful";
 const HIT_OUTCOMES = ["success", "criticalSuccess"];
 const FLAT_TYPE_LABELS = { concealed: "скрыт", hidden: "спрятан", undetected: "не обнаружен", unnoticed: "не замечен" };
 
@@ -52,6 +60,46 @@ async function setToggle(pc, option, value, suboption = null) {
     const toggle = getToggle(pc, option);
     if (!toggle) return;
     await pc.toggleRollOption("all", option, toggle.itemId, value, suboption ?? selectedSub(toggle));
+}
+
+/* ---------- Силовое (forceful) ---------- */
+
+const hasForceful = (weapon) => (weapon?.system.traits.value ?? []).includes("forceful");
+
+/** Уровень силового для n-го удара действия: 0 — 1-я атака в ходу, 1 — 2-я, 2 — 3-я и дальше */
+const forcefulLevel = (map, n) => Math.min(map + n - 1, 2);
+
+/**
+ * Временный скрытый эффект: бонус силового включается только в бросках урона макроса,
+ * в которые передана опция fss-macro:forceful:<уровень>. Значения — как у системного силового.
+ */
+function forcefulEffectData(weapon) {
+    const dice = weapon.system.damage.dice; // с учётом striking-руны
+    const rule = (level, labelKey) => ({
+        key: "FlatModifier",
+        selector: "strike-damage",
+        type: "circumstance",
+        slug: `fss-forceful-${level}`,
+        label: game.i18n.localize(labelKey),
+        value: level * dice,
+        predicate: [`${FORCEFUL_OPTION}:${level}`],
+    });
+    return {
+        type: "effect",
+        name: "Flowing Spirit Strike: силовое (временный эффект макроса)",
+        img: weapon.img,
+        system: {
+            slug: FORCEFUL_EFFECT_SLUG,
+            tokenIcon: { show: false },
+            duration: { value: -1, unit: "unlimited", expiry: null, sustained: false },
+            rules: [rule(1, "PF2E.Item.Weapon.Forceful.Second"), rule(2, "PF2E.Item.Weapon.Forceful.Third")],
+        },
+    };
+}
+
+async function removeForcefulEffect(pc) {
+    const ids = pc.itemTypes.effect.filter((e) => e.slug === FORCEFUL_EFFECT_SLUG).map((e) => e.id);
+    if (ids.length > 0) await pc.deleteEmbeddedDocuments("Item", ids);
 }
 
 /* ---------- Flat check (PF2e Utility Buttons) ---------- */
@@ -125,6 +173,7 @@ async function rollAttack(pc, itemId, map, n) {
     });
     if (!roll) return null; // окно броска закрыли
     result ??= { outcome: null, context: null, messageId: null };
+    result.forceful = forcefulLevel(map, n);
 
     result.flat = await resolveFlatChecks(result.messageId);
     if (result.flat.status === "fail" && HIT_OUTCOMES.includes(result.outcome)) {
@@ -143,7 +192,11 @@ async function rollDamage(pc, itemId, attack, map, { capture = false } = {}) {
     const strike = findStrike(pc, itemId);
     if (!strike) throw new Error(`Strike for item ${itemId} not found`);
     const method = attack.outcome === "criticalSuccess" ? "critical" : "damage";
-    const params = { checkContext: attack.context, mapIncreases: map };
+    const params = {
+        checkContext: attack.context,
+        mapIncreases: map,
+        options: attack.forceful > 0 ? [`${FORCEFUL_OPTION}:${attack.forceful}`] : [],
+    };
     if (!capture) return strike[method](params);
 
     let captured = null;
@@ -386,7 +439,8 @@ async function askOptions(strikes, energy) {
     const content = `
         ${strikeField}
         ${energyField}
-        <p>Какая это атака в ходу? Оба удара бросаются с этим штрафом MAP.</p>`;
+        <p>Какая это атака в ходу? Оба удара бросаются с этим штрафом MAP.
+        Силовое оружия считается от этого номера: 2-й удар действия — следующая атака.</p>`;
 
     const names = ["1-я атака", "2-я атака", "3-я атака"];
     const buttons = [0, 1, 2].map((map) => ({
@@ -448,6 +502,11 @@ async function flowingSpiritStrike() {
             }
         }
 
+        // Силовое: скрытый эффект на время макроса (остатки от прерванного запуска убираем)
+        await removeForcefulEffect(pc);
+        const weapon = findStrike(pc, choice.itemId)?.item;
+        if (hasForceful(weapon)) await pc.createEmbeddedDocuments("Item", [forcefulEffectData(weapon)]);
+
         await setToggle(pc, FSS_OPTION, true, "first-strike");
         const first = await rollAttack(pc, choice.itemId, choice.map, 1);
         if (!first) return;
@@ -464,6 +523,7 @@ async function flowingSpiritStrike() {
     } finally {
         try {
             await setToggle(pc, FSS_OPTION, false, "first-strike");
+            await removeForcefulEffect(pc);
             if (energyChanged) await setToggle(pc, ENERGY_OPTION, energyBefore.on, energyBefore.sub);
             if (performed) await moveSpark(pc);
         } catch (err) {
